@@ -263,8 +263,34 @@ def post_simple_manual_journal_entry(conn: sqlite3.Connection, entry_date: str, 
         print(f"Error in post_simple_manual_journal_entry: {e}")
         conn.rollback()
         return False
-
+    
 def view_bank_account_balance(conn: sqlite3.Connection, bank_account_id: int):
+    """
+    Retrieves the current recorded balance for a specific company bank account.
+
+    Args:
+        conn: Database connection object.
+        bank_account_id: The BankAccountID to query.
+
+    Returns:
+        Decimal: The current balance as a Decimal, or Decimal('0.00') if not found or NULL.
+    """
+    sql = "SELECT CurrentBalance FROM BankAccounts WHERE BankAccountID = ?"
+    result = _execute_sql(conn, sql, (bank_account_id,), fetchone=True)
+    # --- FIX: Ensure Decimal return type ---
+    if result and result['CurrentBalance'] is not None:
+        try:
+            # Explicitly convert the fetched value to Decimal
+            return Decimal(result['CurrentBalance'])
+        except Exception as e:
+            print(f"Error converting bank balance to Decimal for BankAccountID {bank_account_id}: {e}. Value: {result['CurrentBalance']}")
+            # Decide how to handle conversion errors, maybe return None or raise
+            return Decimal('0.00') # Or return None / raise error
+    else:
+        # Return Decimal(0) if account not found or balance is NULL
+        return Decimal('0.00')
+
+
     """
     Retrieves the current recorded balance for a specific company bank account.
 
@@ -293,7 +319,6 @@ def view_gl_account_balance(conn: sqlite3.Connection, account_id: int):
         Decimal: The calculated balance (Debit positive, Credit negative based on BalanceType),
                  or Decimal('0.00') if no entries or account not found.
     """
-    # First, get the account's normal balance type
     coa_sql = "SELECT BalanceType FROM ChartOfAccounts WHERE AccountID = ?"
     coa_info = _execute_sql(conn, coa_sql, (account_id,), fetchone=True)
 
@@ -301,9 +326,8 @@ def view_gl_account_balance(conn: sqlite3.Connection, account_id: int):
         print(f"Warning: AccountID {account_id} not found in ChartOfAccounts.")
         return Decimal('0.00')
 
-    balance_type = coa_info['BalanceType'] # 'Debit' or 'Credit'
+    balance_type = coa_info['BalanceType']
 
-    # Sum ledger entries
     gl_sql = """
         SELECT SUM(DebitAmount) as TotalDebit, SUM(CreditAmount) as TotalCredit
         FROM GeneralLedger
@@ -311,19 +335,23 @@ def view_gl_account_balance(conn: sqlite3.Connection, account_id: int):
     """
     result = _execute_sql(conn, gl_sql, (account_id,), fetchone=True)
 
-    total_debit = result['TotalDebit'] if result and result['TotalDebit'] else Decimal('0.00')
-    total_credit = result['TotalCredit'] if result and result['TotalCredit'] else Decimal('0.00')
+    # --- FIX: Explicitly convert SUM results to Decimal ---
+    try:
+        total_debit = Decimal(result['TotalDebit']) if result and result['TotalDebit'] is not None else Decimal('0.00')
+        total_credit = Decimal(result['TotalCredit']) if result and result['TotalCredit'] is not None else Decimal('0.00')
+    except Exception as e:
+        print(f"Error converting GL SUM results to Decimal for AccountID {account_id}: {e}. Values: D={result.get('TotalDebit', 'N/A')}, C={result.get('TotalCredit', 'N/A')}")
+        return Decimal('0.00') # Or handle error differently
+    # --- END FIX ---
 
-    # Calculate balance based on normal balance type
+
     if balance_type == 'Debit':
         return total_debit - total_credit
     elif balance_type == 'Credit':
         return total_credit - total_debit
     else:
-        # Should not happen due to CHECK constraint, but handle defensively
         print(f"Warning: Unknown BalanceType '{balance_type}' for AccountID {account_id}.")
         return total_debit - total_credit # Default to debit balance convention
-
 def record_bank_transfer(conn: sqlite3.Connection, transaction_date: str, amount: Decimal, source_bank_account_id: int, source_cash_account_id: int, target_bank_account_id: int, target_cash_account_id: int, description: str, created_by_employee_id: int, reference: str = None):
     """
     Logs money moved electronically between two company bank accounts.
