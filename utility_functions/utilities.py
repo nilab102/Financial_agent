@@ -1,6 +1,7 @@
 import sqlite3
 import datetime
 from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP # Import Decimal and rounding mode
 
 # --- Database Connection (Assume this is established elsewhere) ---
 # Example:
@@ -1410,14 +1411,6 @@ def void_bill(conn: sqlite3.Connection, bill_id: int, ap_account_id: int, expens
         return False
 
 # =============================================
-# Payroll Functions (Skipped due to missing schema)
-# =============================================
-# view_employee_payroll_info - Requires EmployeesPayrollInfo table
-# calculate_gross_pay_hourly - Requires EmployeesPayrollInfo table
-# calculate_gross_pay_salary - Requires EmployeesPayrollInfo table
-# list_active_employees - Requires EmployeesPayrollInfo table
-
-# =============================================
 # Reporting & Master Data Functions
 # =============================================
 
@@ -1518,14 +1511,15 @@ def generate_trial_balance(conn: sqlite3.Connection, report_date: str = None):
     """
     active_accounts = _execute_sql(conn, accounts_sql, fetchall=True)
 
-    if active_accounts is None: # Indicates an error occurred
+    if active_accounts is None:
         return None
     if not active_accounts:
+        # Return Decimals here too for consistency
         return {'accounts': [], 'totals': {'debit': Decimal('0.00'), 'credit': Decimal('0.00')}}
 
     trial_balance_accounts = []
-    total_debits = Decimal('0.00')
-    total_credits = Decimal('0.00')
+    total_debits = Decimal('0.00')   # Ensure Decimal init
+    total_credits = Decimal('0.00')  # Ensure Decimal init
 
     gl_sql_base = """
         SELECT SUM(DebitAmount) as TotalDebit, SUM(CreditAmount) as TotalCredit
@@ -1546,8 +1540,9 @@ def generate_trial_balance(conn: sqlite3.Connection, report_date: str = None):
 
             balance_result = _execute_sql(conn, gl_sql_base, gl_params, fetchone=True)
 
-            debit_sum = balance_result['TotalDebit'] if balance_result and balance_result['TotalDebit'] else Decimal('0.00')
-            credit_sum = balance_result['TotalCredit'] if balance_result and balance_result['TotalCredit'] else Decimal('0.00')
+            # Ensure SUM results are Decimal
+            debit_sum = Decimal(balance_result['TotalDebit']) if balance_result and balance_result['TotalDebit'] is not None else Decimal('0.00')
+            credit_sum = Decimal(balance_result['TotalCredit']) if balance_result and balance_result['TotalCredit'] is not None else Decimal('0.00')
 
             balance = Decimal('0.00')
             debit_balance = Decimal('0.00')
@@ -1557,32 +1552,34 @@ def generate_trial_balance(conn: sqlite3.Connection, report_date: str = None):
                 balance = debit_sum - credit_sum
             elif balance_type == 'Credit':
                 balance = credit_sum - debit_sum
-            else: # Should not happen
-                 balance = debit_sum - credit_sum # Default convention
+            else:
+                 balance = debit_sum - credit_sum
 
+            # --- FIX: Explicit Decimal Conversion during Accumulation ---
             if balance > 0:
                 if balance_type == 'Debit':
                     debit_balance = balance
-                    total_debits += balance
+                    total_debits += Decimal(balance) # Explicit conversion
                 else: # Credit balance type
                     credit_balance = balance
-                    total_credits += balance
+                    total_credits += Decimal(balance) # Explicit conversion
             elif balance < 0:
                  # Contra-balance situation
                 if balance_type == 'Debit':
-                    credit_balance = -balance # Show as positive credit
-                    total_credits += -balance
+                    credit_balance = -balance
+                    total_credits += Decimal(-balance) # Explicit conversion
                 else: # Credit balance type
-                    debit_balance = -balance # Show as positive debit
-                    total_debits += -balance
-            # If balance is zero, both debit_balance and credit_balance remain 0
+                    debit_balance = -balance
+                    total_debits += Decimal(-balance) # Explicit conversion
+            # --- END FIX ---
 
+            # Ensure values added to the list are Decimals
             trial_balance_accounts.append({
                 'AccountID': account_id,
                 'AccountNumber': account['AccountNumber'],
                 'AccountName': account['AccountName'],
-                'Debit': debit_balance,
-                'Credit': credit_balance
+                'Debit': Decimal(debit_balance),   # Explicit conversion
+                'Credit': Decimal(credit_balance) # Explicit conversion
             })
 
         return {
@@ -1593,67 +1590,294 @@ def generate_trial_balance(conn: sqlite3.Connection, report_date: str = None):
             }
         }
     except Exception as e:
-        print(f"Error generating trial balance: {e}")
+        # Enhanced error logging inside the loop/function
+        import traceback
+        print(f"Error inside generate_trial_balance processing account ID {account_id if 'account_id' in locals() else 'N/A'}: {e}")
+        traceback.print_exc()
+        print(f"Error generating trial balance: {e}") # Keep original message
         return None
 
 # =============================================
-# Fixed Assets Functions (Simplified)
+# Fixed Assets Functions (Updated/New)
 # =============================================
 
-def record_fixed_asset_purchase(conn: sqlite3.Connection, asset_name: str, purchase_date: str, purchase_cost: Decimal, useful_life_years: int, depreciation_method: str, asset_account_id: int, cash_or_ap_account_id: int, created_by_employee_id: int):
+def record_fixed_asset_purchase_with_fa_table(conn: sqlite3.Connection, asset_name: str, purchase_date: str, purchase_cost: Decimal, useful_life_years: int, depreciation_method: str, depreciation_start_date: str, asset_account_id: int, accum_depr_account_id: int, depr_expense_account_id: int, cash_or_ap_account_id: int, created_by_employee_id: int, asset_tag: str = None, salvage_value: Decimal = Decimal('0.00')):
     """
-    Logs the acquisition of a new fixed asset and posts the initial GL entry.
-    NOTE: Does not create FixedAssets table entries as it's missing from schema.
-          Only performs the GL posting part. Assumes payment decreases cash/increases AP.
+    Logs the acquisition of a new fixed asset, creates a FixedAssets record,
+    and posts the initial GL entry for the purchase.
 
     Args:
         conn: Database connection object.
         asset_name: Description of the asset.
         purchase_date: Date of purchase (YYYY-MM-DD).
         purchase_cost: Cost of the asset (positive Decimal).
-        useful_life_years: Estimated useful life (required for future depreciation calc, not used here).
-        depreciation_method: e.g., 'Straight-line' (not used here).
+        useful_life_years: Estimated useful life (e.g., 5 for 5 years).
+        depreciation_method: 'Straight-line', 'Declining Balance', etc.
+        depreciation_start_date: Date depreciation begins (YYYY-MM-DD).
         asset_account_id: The ChartOfAccounts ID for the fixed asset category.
+        accum_depr_account_id: The ChartOfAccounts ID for the asset's accumulated depreciation.
+        depr_expense_account_id: The ChartOfAccounts ID for the depreciation expense.
         cash_or_ap_account_id: The ChartOfAccounts ID for Cash (if paid cash) or AP (if purchased on credit).
         created_by_employee_id: EmployeeID recording the purchase.
+        asset_tag: Optional unique asset tag number.
+        salvage_value: Estimated salvage value (default 0).
 
     Returns:
-        bool: True on success, False on failure.
+        int: The AssetID of the newly created FixedAsset record, or None on failure.
     """
     if purchase_cost <= 0:
         raise ValueError("Purchase cost must be positive.")
+    if useful_life_years <= 0:
+        raise ValueError("Useful life must be positive.")
+    # Add checks for valid depreciation_method if needed based on CHECK constraint
 
     try:
         conn.execute("BEGIN")
 
-        # Generate General Ledger Entries for acquisition
-        # Debit Fixed Asset Account
-        # Credit Cash or Accounts Payable
-        gl_entries = [
-            (asset_account_id, purchase_cost, Decimal('0.00'), f"Purchase Asset: {asset_name}"),
-            (cash_or_ap_account_id, Decimal('0.00'), purchase_cost, f"Purchase Asset: {asset_name}")
-        ]
-        _generate_gl_entries(conn, gl_entries, created_by_employee_id, entry_type='AssetPurchase', reference=f"Asset:{asset_name}")
+        # 1. Insert into FixedAssets table
+        # Note: CurrentValue is generated, AccumulatedDepreciation starts at 0
+        fa_sql = """
+            INSERT INTO FixedAssets
+            (AssetName, AssetTag, PurchaseDate, PurchaseCost, SalvageValue,
+             DepreciationMethod, UsefulLife, DepreciationStartDate,
+             AssetAccountID, AccumDeprAccountID, DeprExpenseAccountID, Status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active')
+        """
+        fa_params = (
+            asset_name, asset_tag, purchase_date, str(purchase_cost), str(salvage_value),
+            depreciation_method, useful_life_years, depreciation_start_date,
+            asset_account_id, accum_depr_account_id, depr_expense_account_id
+        )
+        cursor = conn.cursor()
+        cursor.execute(fa_sql, fa_params)
+        asset_id = cursor.lastrowid
 
-        # TODO: Insert into a 'FixedAssets' table here if it existed.
-        # Example:
-        # fa_sql = "INSERT INTO FixedAssets (AssetName, PurchaseDate, PurchaseCost, ...) VALUES (?, ?, ?, ...)"
-        # conn.execute(fa_sql, (asset_name, purchase_date, str(purchase_cost), ...))
+        # 2. Generate General Ledger Entries for acquisition
+        #    Debit Fixed Asset Account
+        #    Credit Cash or Accounts Payable
+        gl_entries = [
+            (asset_account_id, purchase_cost, Decimal('0.00'), f"Purchase Asset: {asset_name} (ID: {asset_id})"),
+            (cash_or_ap_account_id, Decimal('0.00'), purchase_cost, f"Purchase Asset: {asset_name} (ID: {asset_id})")
+        ]
+        _generate_gl_entries(conn, gl_entries, created_by_employee_id, entry_type='AssetPurchase', reference=f"FixedAssetID:{asset_id}")
 
         conn.commit()
-        return True
+        return asset_id
+    except sqlite3.IntegrityError as e:
+         print(f"Error recording fixed asset (check constraints/FKs/unique AssetTag): {e}")
+         conn.rollback()
+         return None
     except Exception as e:
-        print(f"Error in record_fixed_asset_purchase: {e}")
+        print(f"Error in record_fixed_asset_purchase_with_fa_table: {e}")
         conn.rollback()
-        return False
+        return None
 
-# view_active_fixed_assets_list - Requires FixedAssets table
+
+def view_active_fixed_assets_list(conn: sqlite3.Connection, asset_account_id: int = None):
+    """
+    Lists active fixed assets, optionally filtering by asset account.
+
+    Args:
+        conn: Database connection object.
+        asset_account_id: Optional ChartOfAccounts ID to filter by.
+
+    Returns:
+        list: A list of dictionaries representing active fixed assets, or None on error.
+    """
+    sql = """
+        SELECT
+            fa.AssetID, fa.AssetName, fa.AssetTag, fa.PurchaseDate,
+            fa.PurchaseCost, fa.AccumulatedDepreciation, fa.CurrentValue,
+            coa.AccountName as AssetAccountName, fa.Status
+        FROM FixedAssets fa
+        JOIN ChartOfAccounts coa ON fa.AssetAccountID = coa.AccountID
+        WHERE fa.Status = 'Active'
+    """
+    params = []
+    if asset_account_id:
+        sql += " AND fa.AssetAccountID = ?"
+        params.append(asset_account_id)
+    sql += " ORDER BY fa.PurchaseDate DESC"
+
+    try:
+        return _execute_sql(conn, sql, tuple(params), fetchall=True)
+    except Exception as e:
+        print(f"Error in view_active_fixed_assets_list: {e}")
+        return None
+
 
 # =============================================
-# Inventory Functions (Skipped due to missing schema)
+# Inventory Functions (New)
 # =============================================
-# check_stock_level_for_item - Requires StockMovements, InventoryItems tables
-# view_inventory_item_details - Requires InventoryItems, Products tables
+
+# --- Prerequisite: Need Products and InventoryItems in DB ---
+# Helper to potentially add sample data if needed for tests
+def _add_sample_product_and_item(conn, prod_sku, prod_name, item_sku, item_name, unit_price, unit_cost, inv_acct_id, cogs_acct_id, uom='Each'):
+    """Adds a sample product and linked inventory item."""
+    try:
+        prod_sql = "INSERT INTO Products (ProductSKU, ProductName, UnitPrice, IsActive) VALUES (?, ?, ?, 1)"
+        cursor = conn.cursor()
+        cursor.execute(prod_sql, (prod_sku, prod_name, str(unit_price)))
+        product_id = cursor.lastrowid
+
+        item_sql = """INSERT INTO InventoryItems
+                      (ProductID, ItemSKU, ItemName, UnitOfMeasure, StandardCost,
+                       InventoryAssetAccountID, COGSAccountID, IsTracked)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, 1)"""
+        cursor.execute(item_sql, (product_id, item_sku, item_name, uom, str(unit_cost), inv_acct_id, cogs_acct_id))
+        item_id = cursor.lastrowid
+        conn.commit()
+        print(f"    Helper: Added ProductID {product_id}, ItemID {item_id}")
+        return item_id
+    except sqlite3.IntegrityError as e:
+        print(f"    Helper Error (Likely Duplicate SKU): {e}")
+        conn.rollback()
+        # Attempt to fetch existing ItemID if duplicate SKU
+        item_fetch_sql = "SELECT ItemID FROM InventoryItems WHERE ItemSKU = ?"
+        existing = _execute_sql(conn, item_fetch_sql, (item_sku,), fetchone=True)
+        return existing['ItemID'] if existing else None
+    except Exception as e:
+        print(f"    Helper Error adding product/item: {e}")
+        conn.rollback()
+        return None
+
+# --- Prerequisite: Need Warehouses in DB ---
+def _add_sample_warehouse(conn, wh_name):
+     """Adds a sample warehouse."""
+     try:
+         wh_sql = "INSERT INTO Warehouses (WarehouseName) VALUES (?)"
+         cursor = conn.cursor()
+         cursor.execute(wh_sql, (wh_name,))
+         warehouse_id = cursor.lastrowid
+         conn.commit()
+         print(f"    Helper: Added WarehouseID {warehouse_id}")
+         return warehouse_id
+     except sqlite3.IntegrityError:
+         conn.rollback()
+         existing = _execute_sql(conn, "SELECT WarehouseID FROM Warehouses WHERE WarehouseName = ?", (wh_name,), fetchone=True)
+         return existing['WarehouseID'] if existing else None
+     except Exception as e:
+        print(f"    Helper Error adding warehouse: {e}")
+        conn.rollback()
+        return None
+
+
+def record_inventory_movement(conn: sqlite3.Connection, item_id: int, movement_date: str, movement_type: str, quantity_change: Decimal, warehouse_id: int, unit_cost: Decimal = None, related_doc_type: str = None, related_doc_id: int = None, related_doc_item_id: int = None, notes: str = None):
+    """
+    Records a single movement of inventory in the StockMovements table.
+
+    Args:
+        conn: Database connection object.
+        item_id: The InventoryItems ItemID being moved.
+        movement_date: Date/Time of movement (YYYY-MM-DD HH:MM:SS).
+        movement_type: 'Purchase', 'Sale', 'Adjustment-In', etc.
+        quantity_change: The change (+ for in, - for out).
+        warehouse_id: The WarehouseID where the movement occurred.
+        unit_cost: Optional cost per unit for this movement.
+        related_doc_type: Optional type of linked document (e.g., 'Bill').
+        related_doc_id: Optional ID of linked document (e.g., BillID).
+        related_doc_item_id: Optional ID of linked document item (e.g., BillItemID).
+        notes: Optional notes.
+
+    Returns:
+        int: The MovementID of the newly created record, or None on failure.
+    """
+    # Add validation for movement_type if needed
+    if quantity_change == 0:
+        print("Warning: Recording a stock movement with zero quantity change.")
+        # Decide if this should be an error or allowed
+
+    sm_sql = """
+        INSERT INTO StockMovements
+        (ItemID, MovementDate, MovementType, QuantityChange, UnitCost, WarehouseID,
+         RelatedDocumentType, RelatedDocumentID, RelatedDocumentItemID, Notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    sm_params = (
+        item_id, movement_date, movement_type, str(quantity_change),
+        str(unit_cost) if unit_cost is not None else None,
+        warehouse_id, related_doc_type, related_doc_id,
+        related_doc_item_id, notes
+    )
+    try:
+        # Using helper function assumed to be available
+        movement_id = _execute_sql(conn, sm_sql, sm_params, commit=True)
+        return movement_id
+    except sqlite3.Error as e:
+        print(f"Error recording stock movement: {e}")
+        conn.rollback() # Ensure rollback if commit=True failed
+        return None
+    except Exception as e:
+        print(f"Unexpected error in record_inventory_movement: {e}")
+        conn.rollback()
+        return None
+
+
+def check_stock_level_for_item(conn: sqlite3.Connection, item_id: int, warehouse_id: int = None):
+    """
+    Calculates the current quantity on hand for an item, optionally filtered by warehouse.
+
+    Args:
+        conn: Database connection object.
+        item_id: The InventoryItems ItemID to check.
+        warehouse_id: Optional WarehouseID to filter by.
+
+    Returns:
+        Decimal: The total quantity on hand, or Decimal('0.00') if no movements found.
+                 Returns None on error.
+    """
+    sql = "SELECT SUM(QuantityChange) as QuantityOnHand FROM StockMovements WHERE ItemID = ?"
+    params = [item_id]
+
+    if warehouse_id:
+        sql += " AND WarehouseID = ?"
+        params.append(warehouse_id)
+
+    try:
+        result = _execute_sql(conn, sql, tuple(params), fetchone=True)
+        if result and result['QuantityOnHand'] is not None:
+            # Ensure result is Decimal
+            return Decimal(result['QuantityOnHand'])
+        else:
+            return Decimal('0.00') # No movements found or NULL sum
+    except Exception as e:
+        print(f"Error in check_stock_level_for_item: {e}")
+        return None
+
+
+def view_inventory_item_details(conn: sqlite3.Connection, item_id: int):
+    """
+    Displays details for a specific inventory item, including its linked product info.
+
+    Args:
+        conn: Database connection object.
+        item_id: The InventoryItems ItemID to view.
+
+    Returns:
+        dict: Dictionary containing merged item and product details, or None if not found/error.
+    """
+    sql = """
+        SELECT
+            ii.ItemID, ii.ItemSKU, ii.ItemName, ii.Description as ItemDescription,
+            ii.UnitOfMeasure, ii.StandardCost, ii.IsTracked,
+            ii.InventoryAssetAccountID, inv_coa.AccountName as InventoryAccountName,
+            ii.COGSAccountID, cogs_coa.AccountName as COGSAccountName,
+            ii.ReorderPoint, ii.PreferredVendorID, v.VendorName as PreferredVendorName,
+            p.ProductID, p.ProductSKU, p.ProductName, p.Description as ProductDescription,
+            p.UnitPrice as ProductUnitPrice, p.IsActive as ProductIsActive
+        FROM InventoryItems ii
+        JOIN Products p ON ii.ProductID = p.ProductID
+        LEFT JOIN ChartOfAccounts inv_coa ON ii.InventoryAssetAccountID = inv_coa.AccountID
+        LEFT JOIN ChartOfAccounts cogs_coa ON ii.COGSAccountID = cogs_coa.AccountID
+        LEFT JOIN Vendors v ON ii.PreferredVendorID = v.VendorID
+        WHERE ii.ItemID = ?
+    """
+    try:
+        return _execute_sql(conn, sql, (item_id,), fetchone=True)
+    except Exception as e:
+        print(f"Error in view_inventory_item_details: {e}")
+        return None
+
 
 # =============================================
 # Tax Functions
@@ -1697,7 +1921,19 @@ def calculate_total_revenue_for_period(conn: sqlite3.Connection, start_date: str
         AND gl.EntryDate BETWEEN ? AND ?
     """
     result = _execute_sql(conn, sql, (start_date, end_date), fetchone=True)
-    return result['TotalRevenue'] if result and result['TotalRevenue'] else Decimal('0.00')
+
+    # --- FIX: Ensure Decimal return type ---
+    if result and result['TotalRevenue'] is not None:
+        try:
+            # Explicitly convert the result of the calculation
+            return Decimal(result['TotalRevenue'])
+        except Exception as e:
+             print(f"Error converting total revenue to Decimal: {e}. Value: {result['TotalRevenue']}")
+             return Decimal('0.00') # Or handle error differently
+    else:
+        # Return Decimal(0) if no revenue or NULL result
+        return Decimal('0.00')
+    # --- END FIX ---
 
 def calculate_total_expenses_for_period(conn: sqlite3.Connection, start_date: str, end_date: str):
     """
@@ -1719,7 +1955,19 @@ def calculate_total_expenses_for_period(conn: sqlite3.Connection, start_date: st
         AND gl.EntryDate BETWEEN ? AND ?
     """
     result = _execute_sql(conn, sql, (start_date, end_date), fetchone=True)
-    return result['TotalExpenses'] if result and result['TotalExpenses'] else Decimal('0.00')
+
+    # --- FIX: Ensure Decimal return type ---
+    if result and result['TotalExpenses'] is not None:
+        try:
+            # Explicitly convert the result of the calculation
+            return Decimal(result['TotalExpenses'])
+        except Exception as e:
+            print(f"Error converting total expenses to Decimal: {e}. Value: {result['TotalExpenses']}")
+            return Decimal('0.00') # Or handle error differently
+    else:
+         # Return Decimal(0) if no expenses or NULL result
+        return Decimal('0.00')
+    # --- END FIX ---
 
 # =============================================
 # Cash Flow Functions (Calculated from CashTransactions)
@@ -1743,22 +1991,31 @@ def calculate_net_cash_change_for_period(conn: sqlite3.Connection, start_date: s
         SELECT
             SUM(CASE WHEN TransactionType = 'Deposit' THEN Amount ELSE 0 END) -
             SUM(CASE WHEN TransactionType = 'Withdrawal' THEN Amount ELSE 0 END)
-            -- Transfers net out to zero in this calculation if using Amount directly
-            -- If Amount was signed, it would be simpler: SUM(Amount)
+            -- Transfers could be included or excluded based on reporting needs.
+            -- This calculates change excluding internal transfers impacting the SUM calculation.
             as NetCashChange
         FROM CashTransactions
         WHERE TransactionDate BETWEEN ? AND ?
-        -- Exclude transfers if they shouldn't affect net change from operations/investing/financing
+        -- If you want to EXCLUDE transfers from this calculation explicitly:
         -- AND TransactionType != 'Transfer'
-        -- Or handle transfers carefully if one side is internal cash, other external
     """
     result = _execute_sql(conn, sql, (start_date, end_date), fetchone=True)
-    return result['NetCashChange'] if result and result['NetCashChange'] else Decimal('0.00')
 
+    # --- FIX: Ensure Decimal return type ---
+    if result and result['NetCashChange'] is not None:
+        try:
+            # Explicitly convert the final calculated value
+            return Decimal(result['NetCashChange'])
+        except Exception as e:
+            print(f"Error converting net cash change to Decimal: {e}. Value: {result['NetCashChange']}")
+            return Decimal('0.00') # Or handle error differently
+    else:
+        # Return Decimal(0) if no transactions or NULL result
+        return Decimal('0.00')
+    # --- END FIX ---
 # =============================================
 # Audit Functions (Assuming AuditLogs table is populated)
 # =============================================
-
 def view_recent_system_logins(conn: sqlite3.Connection, limit: int = 20):
     """
     Shows the most recent login activities recorded in the audit log.
@@ -1771,8 +2028,9 @@ def view_recent_system_logins(conn: sqlite3.Connection, limit: int = 20):
     Returns:
         list: List of dictionaries representing login events, or None on failure.
     """
+    # --- FIX: Remove a.Description ---
     sql = """
-        SELECT a.LogID, a.ChangeDate, a.IPAddress, a.Description, -- Added Description assuming it might hold success/failure
+        SELECT a.LogID, a.ChangeDate, a.IPAddress,
                e.EmployeeID, e.FirstName, e.LastName, e.Email
         FROM AuditLogs a
         LEFT JOIN Employees e ON a.ChangedBy = e.EmployeeID
@@ -1780,9 +2038,11 @@ def view_recent_system_logins(conn: sqlite3.Connection, limit: int = 20):
         ORDER BY a.ChangeDate DESC
         LIMIT ?
     """
+    # --- END FIX ---
     # If 'Login' isn't an ActionType, adjust WHERE clause accordingly
     # (e.g., WHERE TableName = 'System' AND ActionType = 'Authenticate')
-    return _execute_sql(conn, sql, (limit,), fetchall=True)
+    # Assume _execute_sql is defined elsewhere in this file or imported correctly
+    return _execute_sql(conn, sql, (limit,), fetchall=True) # Assuming _execute_sql is defined above
 
 
 def view_user_activity(conn: sqlite3.Connection, employee_id: int, limit: int = 50):
@@ -1804,7 +2064,8 @@ def view_user_activity(conn: sqlite3.Connection, employee_id: int, limit: int = 
         ORDER BY ChangeDate DESC
         LIMIT ?
     """
-    return _execute_sql(conn, sql, (employee_id, limit), fetchall=True)
+    # Assume _execute_sql is defined elsewhere in this file or imported correctly
+    return _execute_sql(conn, sql, (employee_id, limit), fetchall=True) # Assuming _execute_sql is defined above
 
 def view_record_change_history(conn: sqlite3.Connection, table_name: str, record_id: int):
     """
@@ -1826,7 +2087,8 @@ def view_record_change_history(conn: sqlite3.Connection, table_name: str, record
         WHERE a.TableName = ? AND a.RecordID = ?
         ORDER BY a.ChangeDate DESC
     """
-    return _execute_sql(conn, sql, (table_name, record_id), fetchall=True)
+     # Assume _execute_sql is defined elsewhere in this file or imported correctly
+    return _execute_sql(conn, sql, (table_name, record_id), fetchall=True) # Assuming _execute_sql is defined above
 
 
 # =============================================
@@ -1979,3 +2241,166 @@ def view_report_metadata(conn: sqlite3.Connection, report_id: int):
     """
     # Note: Parameters field assumed to be TEXT, might need JSON parsing if stored as JSON
     return _execute_sql(conn, sql, (report_id,), fetchone=True)
+
+
+# =============================================
+# Payroll Functions
+# =============================================
+
+def view_employee_payroll_info(conn: sqlite3.Connection, employee_id: int):
+    """
+    Display key payroll details for a specific employee (pay rate, frequency, type).
+
+    Args:
+        conn: Database connection object.
+        employee_id: The ID of the employee.
+
+    Returns:
+        dict: A dictionary containing payroll details, or None if not found.
+    """
+    sql = """
+        SELECT
+            e.EmployeeID, e.FirstName, e.LastName, e.Status as EmployeeStatus,
+            p.PayType, p.PayFrequency, p.AnnualSalary, p.HourlyRate, p.OvertimeEligible
+        FROM Employees e
+        LEFT JOIN EmployeePayrollInfo p ON e.EmployeeID = p.EmployeeID
+        WHERE e.EmployeeID = ?
+    """
+    result = _execute_sql(conn, sql, (employee_id,), fetchone=True)
+
+    # Convert numeric types back to Decimal using string conversion
+    if result:
+        if result.get('AnnualSalary') is not None:
+            result['AnnualSalary'] = Decimal(str(result['AnnualSalary']))
+        if result.get('HourlyRate') is not None:
+            result['HourlyRate'] = Decimal(str(result['HourlyRate']))
+    return result
+
+
+def calculate_gross_pay_hourly(conn: sqlite3.Connection, employee_id: int, regular_hours: Decimal, overtime_hours: Decimal = Decimal('0.00')):
+    """
+    Calculate the gross pay for an hourly employee based on hours worked.
+    Assumes standard overtime rate of 1.5x.
+
+    Args:
+        conn: Database connection object.
+        employee_id: The ID of the employee.
+        regular_hours: Number of regular hours worked.
+        overtime_hours: Number of overtime hours worked.
+
+    Returns:
+        Decimal: The calculated gross pay, or None if employee is not hourly or info is missing.
+        Raises:
+            ValueError: If employee not found, no payroll info, not hourly, or hours invalid.
+    """
+    payroll_info = view_employee_payroll_info(conn, employee_id)
+
+    if not payroll_info:
+        raise ValueError(f"Employee with ID {employee_id} not found.")
+    if not payroll_info.get('PayType'):
+         raise ValueError(f"Payroll information (PayType) missing for Employee ID {employee_id}.")
+    if payroll_info['PayType'] != 'Hourly':
+        raise ValueError(f"Employee ID {employee_id} is not an Hourly employee (PayType: {payroll_info['PayType']}).")
+    if payroll_info.get('HourlyRate') is None:
+         raise ValueError(f"HourlyRate is missing for Employee ID {employee_id}.")
+    if regular_hours < 0 or overtime_hours < 0:
+        raise ValueError("Hours worked cannot be negative.")
+
+    # Ensure inputs are Decimal
+    regular_hours = Decimal(regular_hours)
+    overtime_hours = Decimal(overtime_hours)
+    hourly_rate = Decimal(payroll_info['HourlyRate']) # Already converted by view func
+
+    overtime_eligible = payroll_info.get('OvertimeEligible', 1) == 1
+
+    # Calculate regular pay
+    regular_pay = regular_hours * hourly_rate
+
+    # Calculate overtime pay
+    overtime_pay = Decimal('0.00')
+    if overtime_hours > 0 and overtime_eligible:
+        overtime_rate = hourly_rate * Decimal('1.5')
+        overtime_pay = overtime_hours * overtime_rate
+
+    total_gross_pay = regular_pay + overtime_pay
+
+    # Return rounded to 2 decimal places
+    return total_gross_pay.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+
+def calculate_gross_pay_salary(conn: sqlite3.Connection, employee_id: int):
+    """
+    Calculate the gross pay for a salaried employee for one pay period based on their PayFrequency.
+
+    Args:
+        conn: Database connection object.
+        employee_id: The ID of the employee.
+
+    Returns:
+        Decimal: The calculated gross pay for the period, or None if not salaried or info missing.
+        Raises:
+            ValueError: If employee not found, no payroll info, not salaried, or info invalid.
+    """
+    payroll_info = view_employee_payroll_info(conn, employee_id)
+
+    if not payroll_info:
+        raise ValueError(f"Employee with ID {employee_id} not found.")
+    if not payroll_info.get('PayType'):
+         raise ValueError(f"Payroll information (PayType) missing for Employee ID {employee_id}.")
+    if payroll_info['PayType'] != 'Salary':
+        raise ValueError(f"Employee ID {employee_id} is not a Salary employee (PayType: {payroll_info['PayType']}).")
+    if payroll_info.get('AnnualSalary') is None:
+         raise ValueError(f"AnnualSalary is missing for Employee ID {employee_id}.")
+    if not payroll_info.get('PayFrequency'):
+        raise ValueError(f"PayFrequency is missing for Employee ID {employee_id}.")
+
+
+    annual_salary = Decimal(payroll_info['AnnualSalary']) # Already converted by view func
+    pay_frequency = payroll_info['PayFrequency']
+
+    periods_per_year = {
+        'Weekly': Decimal(52),
+        'Bi-Weekly': Decimal(26),
+        'Semi-Monthly': Decimal(24),
+        'Monthly': Decimal(12)
+    }
+
+    if pay_frequency not in periods_per_year:
+        raise ValueError(f"Invalid PayFrequency '{pay_frequency}' for Employee ID {employee_id}.")
+
+    pay_per_period = annual_salary / periods_per_year[pay_frequency]
+
+    # Return rounded to 2 decimal places
+    return pay_per_period.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+
+def list_active_employees_for_payroll(conn: sqlite3.Connection):
+    """
+    Generate a list of employees currently marked as active for payroll purposes.
+    Includes basic payroll info needed for processing.
+
+    Args:
+        conn: Database connection object.
+
+    Returns:
+        list: A list of dictionaries for active employees with payroll info, or empty list.
+    """
+    sql = """
+        SELECT
+            e.EmployeeID, e.FirstName, e.LastName,
+            p.PayType, p.PayFrequency, p.AnnualSalary, p.HourlyRate
+        FROM Employees e
+        JOIN EmployeePayrollInfo p ON e.EmployeeID = p.EmployeeID -- Use JOIN to ensure payroll info exists
+        WHERE e.Status = 'Active'
+        ORDER BY e.LastName, e.FirstName
+    """
+    results = _execute_sql(conn, sql, fetchall=True)
+
+    # Convert numeric types back to Decimal using string conversion
+    for row in results:
+        if row.get('AnnualSalary') is not None:
+            row['AnnualSalary'] = Decimal(str(row['AnnualSalary']))
+        if row.get('HourlyRate') is not None:
+            row['HourlyRate'] = Decimal(str(row['HourlyRate']))
+    return results
+
